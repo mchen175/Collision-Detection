@@ -28,7 +28,7 @@ MIN_RANGE = .25
 #   max_range      : metres; farther pixels are discarded (LiDAR gets noisier with range)
 #   edge_strictness: 0 = off ... 10 = strictest. Rejects "flying pixels": a pixel is
 #                    kept only if >= 3 of its 4 neighbours agree with its depth.
-DEFAULT_SETTINGS = {"min_confidence": 2, "max_range": 3.0, "edge_strictness": 6}
+DEFAULT_SETTINGS = {"min_confidence": 0, "max_range": 10, "edge_strictness": 10}
 SETTING_LIMITS = {"min_confidence": (0, 2, int), "max_range": (1.0, 4.0, float), "edge_strictness": (0, 10, int)}
 
 
