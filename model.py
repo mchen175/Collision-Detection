@@ -103,12 +103,43 @@ def prediction(r, v, config=MotionConfig()):
             "scores": scores, "config": asdict(config)}
 
 
+def to_world(point, pose):
+    """Model camera coords (x right, y up, z forward) -> world. ARKit cameras look down -Z."""
+    point = np.asarray(point, float)
+    if pose is None:
+        return point
+    return pose[:3, :3] @ np.array([point[0], point[1], -point[2]]) + pose[:3, 3]
+
+
+def from_world(point, pose):
+    """World -> model camera coords for the camera at `pose` (inverse of to_world)."""
+    point = np.asarray(point, float)
+    if pose is None:
+        return point
+    local = pose[:3, :3].T @ (point - pose[:3, 3])
+    return np.array([local[0], local[1], -local[2]])
+
+
+def vector_from_world(vector, pose):
+    """Rotate a world-frame vector (velocity) into the camera at `pose`; no translation."""
+    vector = np.asarray(vector, float)
+    if pose is None:
+        return vector
+    local = pose[:3, :3].T @ vector
+    return np.array([local[0], local[1], -local[2]])
+
+
 class TrackLost(ValueError):
     pass
 
 
 class TargetTracker:
     """Depth connected-component tracking, after a user selects one isolated object.
+
+    With a camera pose (ARKit camera_transform) the track is kept in WORLD coordinates, so
+    the selected target stays selected while the phone moves: the expected position is
+    re-projected into each new camera view, and velocity is the target's own world motion
+    (camera ego-motion removed). Without a pose the camera is assumed fixed.
 
     This cannot prove identity. The operator must monitor the selected component.
     The current point represents a visible surface, not the object's center of mass.
@@ -155,7 +186,7 @@ class TargetTracker:
                int(xy[:,0].max()), int(xy[:,1].max())]
         return position, len(coords), box
 
-    def select(self, depth, calibration, pixel, timestamp):
+    def select(self, depth, calibration, pixel, timestamp, pose=None):
         points = calibration.points(depth)
         x, y = pixel
         h, w = depth.shape
@@ -165,19 +196,21 @@ class TargetTracker:
         if not np.isfinite(anchor).all():
             raise TrackLost("Click the interior of a target with valid depth")
         position, size, box = self._component(points, anchor, (x,y))
+        world = to_world(position, pose)
         self.history.clear()
-        self.history.append((timestamp, position))
-        self.last_position, self.last_size, self.box = position, size, box
+        self.history.append((timestamp, world))
+        self.last_position, self.last_size, self.box = world, size, box
         self.velocity = np.zeros(3)
 
-    def update(self, depth, calibration, timestamp):
+    def update(self, depth, calibration, timestamp, pose=None):
         if self.last_position is None:
             raise TrackLost("Select a target first")
         dt = timestamp-self.history[-1][0]
         if dt <= 0 or dt > .6:
             raise TrackLost("Missing, repeated or out-of-order capture time; select again")
         points = calibration.points(depth)
-        expected = self.last_position + self.velocity*dt
+        # Where the target should appear in THIS camera view, even if the phone moved.
+        expected = from_world(self.last_position + self.velocity*dt, pose)
         distances = np.linalg.norm(points-expected, axis=2)
         distances[~np.isfinite(distances)] = np.inf
         index = np.unravel_index(int(np.argmin(distances)), distances.shape)
@@ -187,10 +220,11 @@ class TargetTracker:
         position, size, box = self._component(points, points[y,x], (x,y))
         if not .4 <= size/self.last_size <= 2.5:
             raise TrackLost("Target shape/size changed abruptly; select again")
-        if np.linalg.norm(position-self.last_position) > 1.5*dt+.025:
+        world = to_world(position, pose)
+        if np.linalg.norm(world-self.last_position) > 1.5*dt+.025:
             raise TrackLost("Target position jumped; select again")
-        self.history.append((timestamp, position))
-        self.last_position, self.last_size, self.box = position, size, box
+        self.history.append((timestamp, world))
+        self.last_position, self.last_size, self.box = world, size, box
         if len(self.history) < 5 or timestamp-self.history[0][0] < .6:
             return {"state": "WAIT", "message": "Collecting at least 0.6 s of target motion"}
         times = np.array([t for t, _ in self.history])
@@ -199,6 +233,7 @@ class TargetTracker:
         self.velocity = (times[:,None]*positions).sum(axis=0)/(times @ times)
         if np.linalg.norm(self.velocity) > 1.5:
             raise TrackLost("Target exceeds this slow-motion demo's speed limit")
-        result = prediction(position, self.velocity)
-        result["message"] = "One selected target; fixed-camera model"
+        # Predict from the camera's current pose, holding the camera still from now on.
+        result = prediction(position, vector_from_world(self.velocity, pose))
+        result["message"] = "One selected target; camera motion compensated" if pose is not None else "One selected target; fixed-camera model"
         return result

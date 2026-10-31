@@ -21,8 +21,40 @@ from protocol import NativeDecoder, NativeFrame, ProtocolError
 
 ROOT = Path(__file__).resolve().parent
 MAX_GAP = .6
-MAX_TRANSLATION = .02
-MAX_ROTATION = np.deg2rad(2.)
+MIN_RANGE = .25
+
+# Live-tunable depth strictness (sliders in the viewer).
+#   min_confidence : 0 low, 1 medium, 2 high - pixels below this are discarded
+#   max_range      : metres; farther pixels are discarded (LiDAR gets noisier with range)
+#   edge_strictness: 0 = off ... 10 = strictest. Rejects "flying pixels": a pixel is
+#                    kept only if >= 3 of its 4 neighbours agree with its depth.
+DEFAULT_SETTINGS = {"min_confidence": 2, "max_range": 3.0, "edge_strictness": 6}
+SETTING_LIMITS = {"min_confidence": (0, 2, int), "max_range": (1.0, 4.0, float), "edge_strictness": (0, 10, int)}
+
+
+def edge_tolerance(strictness):
+    """Neighbour agreement tolerance in metres at 1 m range: 30 cm (level 1) to 2 cm (level 10)."""
+    return None if strictness <= 0 else .30-(strictness-1)*(.30-.02)/9
+
+
+def filter_depth(depth, confidence, settings):
+    """Return a copy of depth with every pixel failing the strictness settings set to NaN."""
+    out = depth.astype(np.float32, copy=True)
+    if confidence is None:
+        # Raw preview remains visible; prediction requires confidence data.
+        out[:] = np.nan
+        return out
+    with np.errstate(invalid="ignore"):
+        out[confidence < settings["min_confidence"]] = np.nan
+        out[(out < MIN_RANGE) | (out > settings["max_range"])] = np.nan
+        tolerance = edge_tolerance(settings["edge_strictness"])
+        if tolerance is not None:
+            padded = np.pad(out, 1, constant_values=np.nan)
+            neighbours = (padded[:-2, 1:-1], padded[2:, 1:-1], padded[1:-1, :-2], padded[1:-1, 2:])
+            allowed = tolerance*np.maximum(out, 1.)  # noise grows with distance
+            agree = sum((np.abs(n-out) <= allowed).astype(np.uint8) for n in neighbours)
+            out[agree < 3] = np.nan
+    return out
 
 
 def pose_change(reference, current):
@@ -40,7 +72,25 @@ class State:
         self.generation = 0
         self.scenario = "approach"
         self.connection = "Waiting for DebrisCapture"
+        self.settings = dict(DEFAULT_SETTINGS)
         self._reset_stream()
+
+    def configure(self, values):
+        """Validate and apply strictness settings; takes effect on the next frame."""
+        if not isinstance(values, dict):
+            raise ValueError("Settings must be an object")
+        updated = {}
+        for key, number in values.items():
+            if key not in SETTING_LIMITS:
+                raise ValueError(f"Unknown setting: {key}")
+            low, high, kind = SETTING_LIMITS[key]
+            if isinstance(number, bool) or not isinstance(number, (int, float)) or not np.isfinite(number):
+                raise ValueError(f"{key} must be a number")
+            if not low <= number <= high:
+                raise ValueError(f"{key} must be between {low} and {high}")
+            updated[key] = kind(round(number, 2)) if kind is float else int(round(number))
+        with self.lock:
+            self.settings.update(updated)
 
     def _reset_stream(self):
         self.frame = None
@@ -133,13 +183,8 @@ class State:
                 return
             if capture_gap or arrival_gap:
                 self.clear("Stream gap; select the target again")
-            depth = packet.depth_m.copy()
             confidence_available = packet.confidence is not None
-            if confidence_available:
-                depth[packet.confidence < 1] = np.nan
-            else:
-                # Raw preview remains visible; prediction requires confidence data.
-                depth[:] = np.nan
+            depth = filter_depth(packet.depth_m, packet.confidence, self.settings)
             h, w = depth.shape
             calibration = Intrinsics(w, h, **packet.intrinsics, method="ARKit intrinsics scaled to depth map")
             if self.calibration is not None:
@@ -167,7 +212,7 @@ class State:
                                 "motion_age_s": motion_age,
                                 "confidence_available": confidence_available,
                                 "intrinsics_source": calibration.method,
-                                "usable_depth_pixels": int(np.count_nonzero(np.isfinite(depth) & (depth >= .25) & (depth <= 4)))})
+                                "usable_depth_pixels": int(np.count_nonzero(np.isfinite(depth)))})
             self._camera(packet, now)
             if not confidence_available:
                 self.sensor["pose_gate"] = "Confidence map unavailable; preview only"
@@ -175,24 +220,22 @@ class State:
                 return
             if packet.tracking_state != "normal":
                 self.sensor["pose_gate"] = "ARKit tracking is not normal"
-                self.clear("ARKit tracking is limited/unavailable; hold the phone fixed, then select again")
+                self.clear("ARKit tracking is limited/unavailable, so camera motion cannot be compensated; hold still, then select again")
                 return
             self.sensor["pose_gate"] = "Fixed-phone check ready; select a target"
             if self.tracker is None:
                 if self.result["message"] in ("Connected; waiting for native LiDAR frames", "Start capture in DebrisCapture on the iPhone"):
-                    self.result = {"state": "READY", "message": "ARKit calibration ready. Keep the phone fixed and select one small target"}
+                    self.result = {"state": "READY", "message": "ARKit calibration ready. Select one small target; it stays selected if the phone moves"}
                 return
+            # Camera motion is compensated by the tracker (world-frame tracking), so the
+            # target stays selected while the phone moves. Movement is reported only.
             translation, rotation = pose_change(self.reference_pose, packet.camera_transform)
-            if translation > MAX_TRANSLATION or rotation > MAX_ROTATION:
-                self.sensor["pose_gate"] = f"Phone moved {translation*100:.1f} cm / {np.rad2deg(rotation):.1f} degrees"
-                self.clear("Phone moved since selection; fix its position and select the target again")
-                return
-            self.sensor["pose_gate"] = f"Phone fixed: {translation*100:.1f} cm / {np.rad2deg(rotation):.1f} degrees since selection"
+            self.sensor["pose_gate"] = f"Camera moved {translation*100:.1f} cm / {np.rad2deg(rotation):.1f} degrees since selection · compensated"
             if self.last_processed is not None and packet.timestamp_s-self.last_processed < .18:
                 return
             self.last_processed = packet.timestamp_s
             try:
-                self.result = self.tracker.update(depth, calibration, packet.timestamp_s)
+                self.result = self.tracker.update(depth, calibration, packet.timestamp_s, pose=packet.camera_transform)
             except (TrackLost, ValueError) as exc:
                 self.clear(str(exc))
 
@@ -209,11 +252,11 @@ class State:
             if not isinstance(pixel, list) or len(pixel) != 2 or any(type(v) is not int for v in pixel):
                 raise ValueError("Select an integer depth pixel")
             tracker = TargetTracker()
-            tracker.select(self.frame[0], self.calibration, tuple(pixel), self.frame[1])
+            tracker.select(self.frame[0], self.calibration, tuple(pixel), self.frame[1], pose=self.packet.camera_transform)
             self.tracker = tracker
             self.reference_pose = self.packet.camera_transform.copy()
             self.last_processed = self.frame[1]
-            self.result = {"state": "WAIT", "message": "Selected. Keep the phone fixed and move the target slowly"}
+            self.result = {"state": "WAIT", "message": "Selected. Move the target slowly; camera movement is compensated"}
             self.sensor["pose_gate"] = "Phone pose saved at target selection"
 
     def snapshot(self):
@@ -232,7 +275,7 @@ class State:
             return {**self.result, "demo": self.demo, "connection": self.connection,
                     "dimensions": dimensions,
                     "arrival_age": max(0., now-self.frame[2]) if self.frame else None,
-                    "fps": fps, "calibration": asdict(self.calibration) if self.calibration else None,
+                    "fps": fps, "settings": dict(self.settings), "settings_defaults": DEFAULT_SETTINGS, "calibration": asdict(self.calibration) if self.calibration else None,
                     "box": self.tracker.box if self.tracker else None,
                     "scenario": self.scenario, "depth_frames": self.depth_count, "session": self.generation,
                     "frame_sequence": self.last_sequence, "capture_session": self.stream_session,
@@ -422,6 +465,8 @@ def make_handler(state, phone_port=8765, transport="usb", phone_host="127.0.0.1"
                     state.select(value["pixel"])
                 elif self.path == "/reset":
                     state.clear()
+                elif self.path == "/settings":
+                    state.configure(value)
                 elif self.path == "/scenario" and state.demo:
                     if value["scenario"] not in ("approach", "miss"):
                         raise ValueError("Unknown scenario")
